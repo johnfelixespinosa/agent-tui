@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"image/color"
 	"os"
 	"os/exec"
@@ -43,6 +44,7 @@ type AgentInstance struct {
 	ClassName string
 	Tint      color.RGBA
 	kittyB64   string
+	avatarImg  image.Image // per-agent avatar for half-block rendering
 	Bio        string
 	Directives string // operational profile for system prompt
 
@@ -975,12 +977,25 @@ func (m Model) buildInstance(agentMap map[string]*AgentConfig, slot PartySlotCon
 	}
 
 	tint := color.RGBA{def.Tint[0], def.Tint[1], def.Tint[2], 255}
+
+	// Use per-agent avatar if available, otherwise fall back to shared + tinting
+	var agentAvatar image.Image
+	var kittyB64 string
+	if def.AvatarImage != nil {
+		agentAvatar = def.AvatarImage
+		kittyB64 = encodeKittyAvatarDirect(def.AvatarImage)
+	} else {
+		agentAvatar = avatarImage
+		kittyB64 = encodeKittyAvatar(avatarImage, tint)
+	}
+
 	return &AgentInstance{
 		ID:         fmt.Sprintf("%s-%d-%s", partyName, idx, def.Name),
 		AgentName:  def.Name,
 		ClassName:  def.Class,
 		Tint:       tint,
-		kittyB64:   encodeKittyAvatar(avatarImage, tint),
+		kittyB64:   kittyB64,
+		avatarImg:  agentAvatar,
 		Bio:        def.Bio,
 		Directives: def.Directives,
 		Equipped:   slot.Equipped,

@@ -359,7 +359,7 @@ func (m Model) renderPartyBar() string {
 			}
 			avatar = strings.Join(avatarLines, "\n")
 		} else {
-			avatar = renderHalfBlockAvatar(avatarImage, avatarCols, avatarRows)
+			avatar = renderHalfBlockAvatar(displayInst.avatarImg, avatarCols, avatarRows)
 		}
 
 		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(colorTextBright)

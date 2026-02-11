@@ -9,6 +9,7 @@ import (
 	_ "image/jpeg"
 	"image/png"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -64,6 +65,38 @@ func tintImage(img image.Image, tint color.RGBA) *image.RGBA {
 		}
 	}
 	return out
+}
+
+// loadAgentAvatar tries to load a per-agent avatar from assets/<name>.png or .jpg.
+func loadAgentAvatar(name string) image.Image {
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".png", ".jpg"} {
+		path := filepath.Join("assets", lower+ext)
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		img, _, err := image.Decode(f)
+		f.Close()
+		if err != nil {
+			continue
+		}
+		return img
+	}
+	return nil
+}
+
+// encodeKittyAvatarDirect encodes an image as base64 PNG for Kitty protocol
+// without any tinting — used for custom per-agent avatars.
+func encodeKittyAvatarDirect(img image.Image) string {
+	if img == nil {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 // kittyImageSeq returns a Kitty graphics escape sequence that transmits and

@@ -585,10 +585,13 @@ const (
 // wizardAgentPreview returns a placeholder block for the Kitty avatar overlay
 // with agent name and class below.
 func (m Model) wizardAgentPreview(idx int) string {
-	if idx < 0 || idx >= len(m.config.Agents) || avatarImage == nil {
+	if idx < 0 || idx >= len(m.config.Agents) {
 		return ""
 	}
 	a := m.config.Agents[idx]
+	if a.AvatarImage == nil && avatarImage == nil {
+		return ""
+	}
 
 	// Reserve blank space for Kitty graphics overlay
 	avatarLines := make([]string, wizardAvatarRows)
@@ -625,13 +628,18 @@ func (m Model) renderWizardKittyOverlay() string {
 		return ""
 	}
 	w := m.wizard
-	if w.Cursor < 0 || w.Cursor >= len(m.config.Agents) || avatarImage == nil {
+	if w.Cursor < 0 || w.Cursor >= len(m.config.Agents) {
 		return ""
 	}
 
 	a := m.config.Agents[w.Cursor]
-	tint := color.RGBA{a.Tint[0], a.Tint[1], a.Tint[2], 255}
-	b64 := encodeKittyAvatar(avatarImage, tint)
+	var b64 string
+	if a.AvatarImage != nil {
+		b64 = encodeKittyAvatarDirect(a.AvatarImage)
+	} else if avatarImage != nil {
+		tint := color.RGBA{a.Tint[0], a.Tint[1], a.Tint[2], 255}
+		b64 = encodeKittyAvatar(avatarImage, tint)
+	}
 	if b64 == "" {
 		return ""
 	}
