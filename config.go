@@ -27,12 +27,13 @@ type ClassConfig struct {
 }
 
 type AgentConfig struct {
-	Name        string      `yaml:"name"`
-	Class       string      `yaml:"class"`
-	Tint        [3]uint8    `yaml:"tint"`
-	Bio         string      `yaml:"-"` // loaded from <name>.md
-	Directives  string      `yaml:"-"` // operational sections for system prompt
-	AvatarImage image.Image `yaml:"-"` // per-agent avatar loaded from assets/
+	Name            string      `yaml:"name"`
+	Class           string      `yaml:"class"`
+	Tint            [3]uint8    `yaml:"tint"`
+	Bio             string      `yaml:"-"` // loaded from <name>.md
+	Directives      string      `yaml:"-"` // operational sections for system prompt
+	DefaultEquipped []string    `yaml:"-"` // skill IDs from ## Skills section
+	AvatarImage     image.Image `yaml:"-"` // per-agent avatar loaded from assets/
 }
 
 // SkillEntry represents a skill loaded from ~/.claude/skills/*/SKILL.md
@@ -217,6 +218,7 @@ func LoadAgentsFromDir() ([]AgentConfig, error) {
 		if bioData, bioErr := os.ReadFile(bioPath); bioErr == nil {
 			a.Bio = string(bioData)
 			a.Directives = extractDirectives(a.Bio)
+			a.DefaultEquipped = extractSkills(a.Bio)
 		}
 		// Load per-agent avatar image
 		a.AvatarImage = loadAgentAvatar(baseName)
@@ -267,6 +269,31 @@ func extractDirectives(md string) string {
 		sections = append(sections, strings.Join(current, "\n"))
 	}
 	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+// extractSkills parses the ## Skills section from agent markdown,
+// returning a list of skill IDs (one per bullet point).
+func extractSkills(md string) []string {
+	lines := strings.Split(md, "\n")
+	inSkills := false
+	var skills []string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			inSkills = strings.TrimSpace(line[3:]) == "Skills"
+			continue
+		}
+		if inSkills {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "- ") {
+				skill := strings.TrimSpace(trimmed[2:])
+				if skill != "" {
+					skills = append(skills, skill)
+				}
+			}
+		}
+	}
+	return skills
 }
 
 // ── Load Skills from ~/.claude/skills/*/SKILL.md ───────────────────
@@ -470,6 +497,12 @@ The team's strategic thinker. Breaks down complex requirements into structured i
 - Overthinks simple tasks that need a quick fix
 - Cannot execute plans — depends on other agents to implement
 - Slow to start on urgent, time-sensitive work
+
+## Skills
+
+- rails-architect
+- dispatching-parallel-agents
+- executing-plans
 `,
 
 	"Builder": `> "Test first. Build small. Ship clean."
@@ -497,6 +530,13 @@ The team's feature builder. Implements new functionality using strict TDD discip
 - May gold-plate features beyond what was asked
 - Will not optimize or simplify existing code
 - Depends on having a clear spec or plan to follow
+
+## Skills
+
+- write-tests
+- rails-models
+- rails-controllers
+- rails-services
 `,
 
 	"Fixer": `> "I don't build — I cut away what's broken."
@@ -524,6 +564,11 @@ The team's bug fixer and code surgeon. Traces bugs to their root cause, writes a
 - Cannot handle greenfield work — needs existing code to operate on
 - May over-simplify, removing useful complexity
 - Not suited for feature development
+
+## Skills
+
+- sandi-metz-rules
+- rails-inspect
 `,
 
 	"Scout": `> "I report what is. Read the territory, not the map."
@@ -551,6 +596,10 @@ The team's researcher and explorer. Moves through codebases gathering facts, tra
 - Cannot act on findings — reports only
 - Not useful when immediate code changes are needed
 - Reports can be exhaustively detailed when brevity would suffice
+
+## Skills
+
+- rails-inspect
 `,
 
 	"Scribe": `> "What is not documented is not remembered."
@@ -578,6 +627,10 @@ The team's technical writer. Reads source code thoroughly and transforms it into
 - Cannot fix what it documents — even obvious bugs
 - Documentation may lag behind rapid code changes
 - May over-document trivial self-explanatory code
+
+## Skills
+
+- skill-creator
 `,
 
 	"Guard": `> "Every input is hostile until proven otherwise."
@@ -605,6 +658,11 @@ The team's security specialist. Reviews code for vulnerabilities, validates inpu
 - Blocks low-risk changes that don't warrant scrutiny
 - Slow to approve, creating bottlenecks on fast-moving projects
 - Cannot build features, only guard them
+
+## Skills
+
+- write-tests
+- rails-testing-conventions
 `,
 
 	"Reviewer": `> "I won't give you the answer. I'll give you the question that finds it."
@@ -632,6 +690,12 @@ The team's code reviewer and mentor. Examines code for quality, clarity, and cor
 - Cannot execute — review and teaching only
 - Slow on urgent fixes where speed matters more than learning
 - Questions can feel excessive on simple, obvious issues
+
+## Skills
+
+- rails-model-conventions
+- rails-controller-conventions
+- rails-view-conventions
 `,
 
 	"Tester": `> "The tests tell you what the code needs. I just listen."
@@ -659,6 +723,12 @@ The team's test engineer and CI specialist. Writes behavior-driven tests, mainta
 - Cannot fix production code — only reports what's broken through tests
 - May write excessive tests for trivial code
 - Cannot catch issues that aren't testable
+
+## Skills
+
+- write-tests
+- rails-tests
+- rails-testing-conventions
 `,
 }
 

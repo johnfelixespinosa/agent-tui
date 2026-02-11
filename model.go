@@ -989,6 +989,11 @@ func (m Model) buildInstance(agentMap map[string]*AgentConfig, slot PartySlotCon
 		kittyB64 = encodeKittyAvatar(avatarImage, tint)
 	}
 
+	equipped := slot.Equipped
+	if len(equipped) == 0 {
+		equipped = def.DefaultEquipped
+	}
+
 	return &AgentInstance{
 		ID:         fmt.Sprintf("%s-%d-%s", partyName, idx, def.Name),
 		AgentName:  def.Name,
@@ -998,7 +1003,7 @@ func (m Model) buildInstance(agentMap map[string]*AgentConfig, slot PartySlotCon
 		avatarImg:  agentAvatar,
 		Bio:        def.Bio,
 		Directives: def.Directives,
-		Equipped:   slot.Equipped,
+		Equipped:   equipped,
 		Passives:   slot.Passives,
 		Status:     "idle",
 		Task:       "Awaiting orders...",
