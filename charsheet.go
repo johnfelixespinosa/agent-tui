@@ -8,6 +8,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Pre-allocated style for character sheet headers.
+var csHeaderStyle = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+
 // renderCharSheet renders the full character sheet modal in the terminal pane area.
 func (m Model) renderCharSheet(inst *AgentInstance, tw, th int) string {
 	// Get XP/Level
@@ -20,10 +23,7 @@ func (m Model) renderCharSheet(inst *AgentInstance, tw, th int) string {
 	}
 	nextXP := XPForNextLevel(level)
 
-	className := inst.ClassName
-	if len(className) > 0 {
-		className = strings.ToUpper(className[:1]) + className[1:]
-	}
+	className := strings.Title(inst.ClassName)
 
 	isRunning := inst.Status == "running"
 
@@ -121,12 +121,11 @@ func (m Model) renderCharSheet(inst *AgentInstance, tw, th int) string {
 // ── Equipped Section ───────────────────────────────────────────────
 
 func (m Model) renderEquippedSection(inst *AgentInstance) string {
-	sectionStyle := lipgloss.NewStyle().Foreground(colorText)
-	headerStyle := lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+	sectionStyle := styleText
 
 	isActive := m.csSection == 0
 
-	header := headerStyle.Render("┌─ EQUIPPED ──────────────┐")
+	header := csHeaderStyle.Render("┌─ EQUIPPED ──────────────┐")
 
 	classCfg := m.config.Classes[inst.ClassName]
 
@@ -182,7 +181,7 @@ func (m Model) renderEquippedSection(inst *AgentInstance) string {
 		cursor++
 	}
 
-	lines = append(lines, headerStyle.Render("└─────────────────────────┘"))
+	lines = append(lines, csHeaderStyle.Render("└─────────────────────────┘"))
 
 	return sectionStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
 		append([]string{header}, lines...)...,
@@ -192,11 +191,9 @@ func (m Model) renderEquippedSection(inst *AgentInstance) string {
 // ── Available Section ──────────────────────────────────────────────
 
 func (m Model) renderAvailableSection(inst *AgentInstance) string {
-	headerStyle := lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
-
 	isActive := m.csSection == 1
 
-	header := headerStyle.Render("┌─ AVAILABLE ─────────────┐")
+	header := csHeaderStyle.Render("┌─ AVAILABLE ─────────────┐")
 
 	avail := m.availableSkills(inst)
 	sort.Strings(avail)
@@ -221,7 +218,7 @@ func (m Model) renderAvailableSection(inst *AgentInstance) string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(colorTextDim).Render("  (all equipped)"))
 	}
 
-	lines = append(lines, headerStyle.Render("└─────────────────────────┘"))
+	lines = append(lines, csHeaderStyle.Render("└─────────────────────────┘"))
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		append([]string{header}, lines...)...,
@@ -231,9 +228,7 @@ func (m Model) renderAvailableSection(inst *AgentInstance) string {
 // ── Stats Section ──────────────────────────────────────────────────
 
 func (m Model) renderStatsSection(inst *AgentInstance, className string, level, xp, nextXP int) string {
-	headerStyle := lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
-
-	header := headerStyle.Render("┌─ STATS ─────────────────┐")
+	header := csHeaderStyle.Render("┌─ STATS ─────────────────┐")
 
 	statLine := func(label, value string) string {
 		return fmt.Sprintf("  %-9s %s",
@@ -265,7 +260,7 @@ func (m Model) renderStatsSection(inst *AgentInstance, className string, level, 
 		}
 	}
 
-	lines = append(lines, headerStyle.Render("└─────────────────────────┘"))
+	lines = append(lines, csHeaderStyle.Render("└─────────────────────────┘"))
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		append([]string{header}, lines...)...,
@@ -275,9 +270,7 @@ func (m Model) renderStatsSection(inst *AgentInstance, className string, level, 
 // ── Profile Section ────────────────────────────────────────────────
 
 func (m Model) renderBioSection(inst *AgentInstance, maxWidth int) string {
-	headerStyle := lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
-
-	header := headerStyle.Render("┌─ PROFILE ───────────────┐")
+	header := csHeaderStyle.Render("┌─ PROFILE ───────────────┐")
 
 	// Style each line based on markdown content
 	bioLines := strings.Split(inst.Bio, "\n")
@@ -343,7 +336,7 @@ func (m Model) renderBioSection(inst *AgentInstance, maxWidth int) string {
 		lines = append(lines, bottomIndicator)
 	}
 
-	lines = append(lines, headerStyle.Render("└─────────────────────────┘"))
+	lines = append(lines, csHeaderStyle.Render("└─────────────────────────┘"))
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		append([]string{header}, lines...)...,

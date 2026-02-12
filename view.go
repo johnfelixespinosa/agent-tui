@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -24,6 +25,16 @@ var (
 	colorYellow     = lipgloss.Color("#c9a959")
 )
 
+// Pre-allocated styles for hot render paths.
+var (
+	styleNameBright = lipgloss.NewStyle().Bold(true).Foreground(colorTextBright)
+	styleTextDim    = lipgloss.NewStyle().Foreground(colorTextDim)
+	styleText       = lipgloss.NewStyle().Foreground(colorText)
+	styleYellowBold = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+	styleYellow     = lipgloss.NewStyle().Foreground(colorYellow)
+	styleGreen      = lipgloss.NewStyle().Foreground(colorGreen)
+)
+
 func statusColor(status string) lipgloss.Color {
 	switch status {
 	case "running":
@@ -34,6 +45,21 @@ func statusColor(status string) lipgloss.Color {
 		return colorTextDim
 	}
 	return colorTextDim
+}
+
+// displayStatus returns a human-readable status and color for an agent.
+func displayStatus(inst *AgentInstance) (string, lipgloss.Color) {
+	switch inst.Status {
+	case "running":
+		if time.Since(inst.lastOutputAt) > 3*time.Second {
+			return "IDLE", colorYellow
+		}
+		return "WORKING", colorGreen
+	case "exited":
+		return "EXITED", colorRed
+	default:
+		return "STANDBY", colorTextDim
+	}
 }
 
 // ── View ───────────────────────────────────────────────────────────
@@ -47,23 +73,28 @@ func (m Model) View() string {
 		return m.renderDeleteConfirm()
 	}
 
+	if m.mode == ModeCommandPalette {
+		return m.renderCommandPalette()
+	}
+
 	if m.wizard != nil {
 		return m.renderWizard() + m.renderWizardKittyOverlay()
 	}
-
-	// Header
-	header := m.renderHeader()
 
 	// Left panel + Main pane (left panel's BorderRight provides the divider)
 	leftPanel := m.renderLeftPanel()
 	mainPane := m.renderMainPane()
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, mainPane)
+	if m.showGitPanel {
+		gitPanel := m.renderGitPanel()
+		body = lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, mainPane, gitPanel)
+	}
 
 	// Status bar
 	statusBar := m.renderStatusBar()
 
-	view := lipgloss.JoinVertical(lipgloss.Left, header, body, statusBar)
+	view := lipgloss.JoinVertical(lipgloss.Left, body, statusBar)
 
 	// Kitty graphics overlay
 	view += m.renderKittyOverlay()
@@ -72,6 +103,63 @@ func (m Model) View() string {
 }
 
 // ── Header ─────────────────────────────────────────────────────────
+
+func (m Model) renderCommandPalette() string {
+	paletteWidth := 50
+	if m.width < paletteWidth+4 {
+		paletteWidth = m.width - 4
+	}
+
+	inputStyle := lipgloss.NewStyle().
+		Foreground(colorTextBright).
+		Background(colorBgLight).
+		Width(paletteWidth - 6).
+		Padding(0, 1)
+
+	input := inputStyle.Render(": " + m.cmdPaletteInput + "█")
+
+	actions := m.filteredPaletteActions()
+	maxVisible := 12
+	if len(actions) < maxVisible {
+		maxVisible = len(actions)
+	}
+
+	var lines []string
+	for i := 0; i < maxVisible; i++ {
+		prefix := "  "
+		style := lipgloss.NewStyle().Foreground(colorTextDim)
+		if i == m.cmdPaletteCursor {
+			prefix = "> "
+			style = lipgloss.NewStyle().Foreground(colorTextBright).Bold(true)
+		}
+		lines = append(lines, style.Render(prefix+actions[i].Label))
+	}
+	if len(actions) == 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorTextDim).Render("  (no matches)"))
+	}
+	if len(actions) > maxVisible {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorTextDim).
+			Render(fmt.Sprintf("  ... %d more", len(actions)-maxVisible)))
+	}
+
+	list := strings.Join(lines, "\n")
+
+	box := lipgloss.NewStyle().
+		Width(paletteWidth).
+		Padding(1, 2).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorYellow).
+		Background(colorBgMedium).
+		Render(lipgloss.JoinVertical(lipgloss.Left, input, "", list))
+
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Top).
+		PaddingTop(2).
+		Background(colorBgDark).
+		Render(box)
+}
 
 func (m Model) renderHeader() string {
 	modeStr := "NORMAL"
@@ -88,6 +176,9 @@ func (m Model) renderHeader() string {
 		modeColor = colorBlue
 	case ModeCheckout:
 		modeStr = "CHECKOUT"
+		modeColor = colorYellow
+	case ModeCommandPalette:
+		modeStr = "COMMAND"
 		modeColor = colorYellow
 	}
 
@@ -155,7 +246,7 @@ func (m Model) renderLeftPanel() string {
 	lines = append(lines, lipgloss.NewStyle().Foreground(colorGreen).Render("  + New Party"))
 
 	// Calculate total body height: terminal(border+content) + party bar
-	_, _, _, _, ph, _ := m.cardLayout()
+	ph := m.layout.PartyHeight
 	th := m.termHeight()
 	bodyHeight := th + 2 + ph // terminal with border + party bar
 
@@ -257,6 +348,15 @@ func (m Model) renderEmptyTerminal(tw, th int, borderColor lipgloss.Color, msg s
 }
 
 func (m Model) renderCheckoutModal(tw, th int) string {
+	switch m.checkoutStep {
+	case 1:
+		return m.renderScrollModal(tw, th)
+	case 2:
+		return m.renderHandoffModal(tw, th)
+	case 3:
+		return m.renderWorktreeDisposition(tw, th)
+	}
+
 	agent := m.checkoutAgent
 	name := agent.AgentName
 	class := agent.ClassName
@@ -301,6 +401,132 @@ func (m Model) renderCheckoutModal(tw, th int) string {
 		Render(box)
 }
 
+func (m Model) renderScrollModal(tw, th int) string {
+	modal := lipgloss.NewStyle().
+		Width(44).
+		Padding(1, 2).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorYellow).
+		Foreground(colorText).
+		Background(colorBgMedium).
+		Align(lipgloss.Center)
+
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorTextBright).
+		Render("Save as Scroll?")
+	desc := lipgloss.NewStyle().Foreground(colorTextDim).
+		Render("Save this session's prompt as\na reusable skill (Scroll)")
+
+	inputStyle := lipgloss.NewStyle().
+		Foreground(colorTextBright).
+		Background(colorBgLight).
+		Padding(0, 1)
+	input := inputStyle.Render(m.scrollNameBuf + "█")
+
+	hint := lipgloss.NewStyle().Foreground(colorTextDim).
+		Render("type:name  enter:save  esc:skip")
+
+	content := lipgloss.JoinVertical(lipgloss.Center, title, "", desc, "", input, "", hint)
+	box := modal.Render(content)
+
+	return lipgloss.NewStyle().
+		Width(tw + 2).
+		Height(th + 2).
+		Align(lipgloss.Center, lipgloss.Center).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Render(box)
+}
+
+func (m Model) renderHandoffModal(tw, th int) string {
+	agent := m.checkoutAgent
+	p := m.party()
+
+	modal := lipgloss.NewStyle().
+		Width(44).
+		Padding(1, 2).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorYellow).
+		Foreground(colorText).
+		Background(colorBgMedium).
+		Align(lipgloss.Center)
+
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorTextBright).
+		Render(fmt.Sprintf("Handoff from %s", agent.AgentName))
+	question := lipgloss.NewStyle().Foreground(colorText).
+		Render("Pass context to another agent?")
+
+	var targetLines []string
+	if p != nil {
+		idx := 0
+		for _, inst := range p.Slots {
+			if inst != nil && inst != agent {
+				prefix := "  "
+				style := lipgloss.NewStyle().Foreground(colorTextDim)
+				if idx == m.handoffTarget {
+					prefix = "> "
+					style = lipgloss.NewStyle().Foreground(colorTextBright).Bold(true)
+				}
+				status := strings.ToUpper(inst.Status)
+				targetLines = append(targetLines,
+					style.Render(fmt.Sprintf("%s%s (%s)", prefix, inst.AgentName, status)))
+				idx++
+			}
+		}
+	}
+	if len(targetLines) == 0 {
+		targetLines = append(targetLines,
+			lipgloss.NewStyle().Foreground(colorTextDim).Render("  (no other agents)"))
+	}
+
+	targets := strings.Join(targetLines, "\n")
+	hint := lipgloss.NewStyle().Foreground(colorTextDim).
+		Render("↑↓:select  enter:handoff  esc:skip")
+
+	content := lipgloss.JoinVertical(lipgloss.Center, title, "", question, "", targets, "", hint)
+	box := modal.Render(content)
+
+	return lipgloss.NewStyle().
+		Width(tw + 2).
+		Height(th + 2).
+		Align(lipgloss.Center, lipgloss.Center).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Render(box)
+}
+
+func (m Model) renderWorktreeDisposition(tw, th int) string {
+	agent := m.checkoutAgent
+
+	modal := lipgloss.NewStyle().
+		Width(44).
+		Padding(1, 2).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorYellow).
+		Foreground(colorText).
+		Background(colorBgMedium).
+		Align(lipgloss.Center)
+
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorTextBright).
+		Render("Git Worktree")
+	branchInfo := lipgloss.NewStyle().Foreground(colorTextDim).
+		Render(fmt.Sprintf("Branch: %s", agent.Branch))
+	question := lipgloss.NewStyle().Foreground(colorText).
+		Render("What to do with this branch?")
+	options := lipgloss.NewStyle().Foreground(colorYellow).
+		Render("[1] Merge to main\n[2] Keep on branch\n[3] Discard changes\n[Esc] Keep (default)")
+
+	content := lipgloss.JoinVertical(lipgloss.Center, title, branchInfo, "", question, "", options)
+	box := modal.Render(content)
+
+	return lipgloss.NewStyle().
+		Width(tw + 2).
+		Height(th + 2).
+		Align(lipgloss.Center, lipgloss.Center).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Render(box)
+}
+
 // ── Party Bar ──────────────────────────────────────────────────────
 
 func (m Model) renderPartyBar() string {
@@ -309,7 +535,11 @@ func (m Model) renderPartyBar() string {
 		return ""
 	}
 
-	cardWidth, avatarCols, avatarRows, cardHeight, _, cardsPerRow := m.cardLayout()
+	cardWidth := m.layout.CardWidth
+	avatarCols := m.layout.AvatarCols
+	avatarRows := m.layout.AvatarRows
+	cardHeight := m.layout.CardHeight
+	cardsPerRow := m.layout.CardsPerRow
 
 	barBorderColor := colorBorder
 	if m.focus == FocusPartyBar {
@@ -348,8 +578,6 @@ func (m Model) renderPartyBar() string {
 			}
 		}
 
-		sc := statusColor(displayInst.Status)
-
 		// Avatar placeholder for Kitty overlay (centered with margin)
 		var avatar string
 		if displayInst.kittyB64 != "" {
@@ -359,21 +587,25 @@ func (m Model) renderPartyBar() string {
 			}
 			avatar = strings.Join(avatarLines, "\n")
 		} else {
-			avatar = renderHalfBlockAvatar(displayInst.avatarImg, avatarCols, avatarRows)
+			avatar = displayInst.halfBlockAvatar(avatarCols, avatarRows)
 		}
 
-		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(colorTextBright)
-		classStyle := lipgloss.NewStyle().Foreground(colorTextDim)
+		nameStyle := styleNameBright
+		classStyle := styleTextDim
+
+		// Class display name (title case)
+		className := strings.Title(displayInst.ClassName)
+
+		// Level from roster
+		lvlStr := ""
+		if entry := m.roster.Agents[displayInst.AgentName]; entry != nil {
+			lvlStr = fmt.Sprintf(" Lv.%d", entry.Level)
+		}
+		lvlStyle := styleYellow
+
+		// Activity-based status display
+		statusText, sc := displayStatus(displayInst)
 		statStyle := lipgloss.NewStyle().Foreground(sc)
-
-		// Get class display name
-		className := displayInst.ClassName
-		if cls := m.config.Classes[className]; cls != nil {
-			// Capitalize first letter
-			if len(className) > 0 {
-				className = strings.ToUpper(className[:1]) + className[1:]
-			}
-		}
 
 		// HP bar (context window usage)
 		hpBar := renderHPBar(displayInst, cardWidth-2)
@@ -381,9 +613,9 @@ func (m Model) renderPartyBar() string {
 		content := lipgloss.JoinVertical(
 			lipgloss.Center,
 			avatar,
-			nameStyle.Render(displayInst.AgentName),
+			nameStyle.Render(displayInst.AgentName)+lvlStyle.Render(lvlStr),
 			classStyle.Render(className),
-			statStyle.Render(strings.ToUpper(displayInst.Status)),
+			statStyle.Render(statusText),
 			hpBar,
 		)
 
@@ -406,12 +638,186 @@ func (m Model) renderPartyBar() string {
 	}
 	cardsBlock := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
+	// Project directory footer
+	projPath := p.Project
+	maxProjW := m.mainPaneWidth() - 6
+	if maxProjW < 10 {
+		maxProjW = 10
+	}
+	if len(projPath) > maxProjW {
+		projPath = "..." + projPath[len(projPath)-maxProjW+3:]
+	}
+	projLine := lipgloss.NewStyle().
+		Foreground(colorTextDim).
+		Render("  " + projPath)
+
+	partyContent := lipgloss.JoinHorizontal(lipgloss.Center, partyLabel, " ", cardsBlock)
+
 	return lipgloss.NewStyle().
 		Background(colorBgDark).
 		Padding(0, 1).
 		Render(
-			lipgloss.JoinHorizontal(lipgloss.Center, partyLabel, " ", cardsBlock),
+			lipgloss.JoinVertical(lipgloss.Left, partyContent, projLine),
 		)
+}
+
+// ── Git Panel ──────────────────────────────────────────────────────
+
+func (m Model) renderGitPanel() string {
+	if m.gitPanelMode == 1 {
+		return m.renderPRPanel()
+	}
+
+	ph := m.layout.PartyHeight
+	th := m.termHeight()
+	bodyHeight := th + 2 + ph // terminal with border + party bar
+
+	contentHeight := bodyHeight - 2 // border top/bottom
+
+	// Clamp scroll
+	maxScroll := len(m.gitTreeLines) - contentHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.gitPanelScroll > maxScroll {
+		m.gitPanelScroll = maxScroll
+	}
+
+	// Slice visible lines
+	start := m.gitPanelScroll
+	end := start + contentHeight
+	if end > len(m.gitTreeLines) {
+		end = len(m.gitTreeLines)
+	}
+
+	dirStyle := lipgloss.NewStyle().Foreground(colorYellow)
+	fileStyle := lipgloss.NewStyle().Foreground(colorText)
+
+	var lines []string
+	for i := start; i < end; i++ {
+		line := m.gitTreeLines[i]
+		if strings.HasSuffix(line, "/") {
+			lines = append(lines, dirStyle.Render(truncLine(line, gitPanelWidth-2)))
+		} else {
+			lines = append(lines, fileStyle.Render(truncLine(line, gitPanelWidth-2)))
+		}
+	}
+
+	// Pad remaining height
+	for len(lines) < contentHeight {
+		lines = append(lines, "")
+	}
+
+	content := strings.Join(lines, "\n")
+
+	return lipgloss.NewStyle().
+		Width(gitPanelWidth).
+		Height(bodyHeight).
+		BorderLeft(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorBorder).
+		Background(colorBgDark).
+		Render(
+			lipgloss.NewStyle().
+				Foreground(colorYellow).
+				Bold(true).
+				Render(" FILES  (g:PRs)") + "\n" + content,
+		)
+}
+
+func (m Model) renderPRPanel() string {
+	ph := m.layout.PartyHeight
+	th := m.termHeight()
+	bodyHeight := th + 2 + ph
+
+	contentHeight := bodyHeight - 2
+
+	var lines []string
+	if m.prLoading {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorTextDim).Render(" Loading..."))
+	} else if len(m.prList) == 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorTextDim).Render(" No open PRs"))
+	} else {
+		// Clamp scroll
+		maxScroll := len(m.prList)*3 - contentHeight
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.gitPanelScroll > maxScroll {
+			m.gitPanelScroll = maxScroll
+		}
+
+		for _, pr := range m.prList {
+			icon := pr.StatusIcon()
+			iconColor := colorTextDim
+			switch icon {
+			case "✓":
+				iconColor = colorGreen
+			case "✗":
+				iconColor = colorRed
+			case "●":
+				iconColor = colorBlue
+			case "○":
+				iconColor = colorYellow
+			}
+			iconStr := lipgloss.NewStyle().Foreground(iconColor).Render(icon)
+
+			numStr := lipgloss.NewStyle().Foreground(colorTextDim).
+				Render(fmt.Sprintf("#%d", pr.Number))
+			title := truncLine(pr.Title, gitPanelWidth-8)
+			titleStr := lipgloss.NewStyle().Foreground(colorText).Render(title)
+
+			branchStr := lipgloss.NewStyle().Foreground(colorTextDim).
+				Render("  " + truncLine(pr.Branch, gitPanelWidth-4))
+
+			lines = append(lines, fmt.Sprintf(" %s %s %s", iconStr, numStr, titleStr))
+			lines = append(lines, branchStr)
+			lines = append(lines, "")
+		}
+	}
+
+	// Apply scroll
+	start := m.gitPanelScroll
+	if start > len(lines) {
+		start = len(lines)
+	}
+	lines = lines[start:]
+
+	// Pad
+	for len(lines) < contentHeight {
+		lines = append(lines, "")
+	}
+	if len(lines) > contentHeight {
+		lines = lines[:contentHeight]
+	}
+
+	content := strings.Join(lines, "\n")
+
+	return lipgloss.NewStyle().
+		Width(gitPanelWidth).
+		Height(bodyHeight).
+		BorderLeft(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorBorder).
+		Background(colorBgDark).
+		Render(
+			lipgloss.NewStyle().
+				Foreground(colorYellow).
+				Bold(true).
+				Render(" PULL REQUESTS  (g:close)") + "\n" + content,
+		)
+}
+
+func truncLine(s string, maxW int) string {
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	// Trim rune by rune
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r)) > maxW {
+		r = r[:len(r)-1]
+	}
+	return string(r)
 }
 
 // ── Status Bar ─────────────────────────────────────────────────────
@@ -449,15 +855,24 @@ func (m Model) renderStatusBar() string {
 	case ModeCharSheet:
 		hints = "↑↓:navigate  tab:section  space:equip  []:scroll  s:start  esc:close"
 	case ModeCheckout:
-		hints = "1:great  2:normal  3:rough  esc:skip"
+		switch m.checkoutStep {
+		case 0:
+			hints = "1:great  2:normal  3:rough  esc:skip"
+		case 1:
+			hints = "type:name  enter:save  esc:skip"
+		case 2:
+			hints = "↑↓:select  enter:handoff  esc:skip"
+		case 3:
+			hints = "1:merge  2:keep  3:discard  esc:keep"
+		}
 	default:
 		switch m.focus {
 		case FocusLeftPanel:
 			hints = "↑↓:party  n:new  d:delete  enter:switch  tab:focus"
 		case FocusMainPane:
-			hints = "s:start  i:insert  x:stop  enter:sheet  space:swap  ←→:agent  tab:focus"
+			hints = "s:start  i:insert  x:stop  enter:sheet  space:swap  g:files  ←→:agent  tab:focus"
 		case FocusPartyBar:
-			hints = "←→:agent  enter:sheet  s:start  tab:focus"
+			hints = "←→:agent  enter:sheet  s:start  g:files  tab:focus"
 		}
 	}
 
@@ -476,8 +891,15 @@ func (m Model) renderStatusBar() string {
 
 // ── Kitty Overlay ──────────────────────────────────────────────────
 
+// Package-level key tracking — only clear images when layout actually changes.
+var lastOverlayKey string
+
 func (m Model) renderKittyOverlay() string {
-	if m.mode == ModeCharSheet || m.mode == ModeCheckout {
+	if m.mode == ModeCheckout {
+		if lastOverlayKey != "" {
+			lastOverlayKey = ""
+			return "\x1b_Ga=d,d=a,q=2\x1b\\"
+		}
 		return ""
 	}
 
@@ -486,19 +908,39 @@ func (m Model) renderKittyOverlay() string {
 		return ""
 	}
 
-	var buf strings.Builder
-	// Delete all previous images
-	buf.WriteString("\x1b_Ga=d,d=a,q=2\x1b\\")
-
-	cw, avatarCols, avatarRows, cardHeight, _, cardsPerRow := m.cardLayout()
+	cw := m.layout.CardWidth
+	avatarCols := m.layout.AvatarCols
+	avatarRows := m.layout.AvatarRows
+	cardHeight := m.layout.CardHeight
+	cardsPerRow := m.layout.CardsPerRow
 	th := m.termHeight()
 
-	// Row: header(1) + terminal top border(1) + termHeight + terminal bottom border(1)
-	// + party bar padding top(0) + card top border(1) + 1 for content start
-	avatarRowBase := 1 + 1 + th + 1 + 1 + 1 // = th + 5
+	// Build a key from factors that affect avatar positions/content
+	var keyBuf strings.Builder
+	fmt.Fprintf(&keyBuf, "%d:%d:%d:%d:%d:%v:", m.activeParty, th, cw, avatarCols, avatarRows, m.showGitPanel)
+	for i := 0; i < MaxPartySlots; i++ {
+		if p.Slots[i] != nil {
+			keyBuf.WriteString(p.Slots[i].ID)
+		}
+		keyBuf.WriteByte(',')
+	}
+	if m.mode == ModeSwap {
+		fmt.Fprintf(&keyBuf, "swap:%d:%d", m.selectedAgent, m.swapIndex)
+	}
+	key := keyBuf.String()
 
-	// Column: leftPanel(leftPanelWidth) + border(1) + party bar padding(1)
-	// + party label(1) + margin(1) + space(1) + card border(1) + avatar margin(1)
+	var buf strings.Builder
+
+	// Always clear before placing — Kitty placements persist across redraws
+	// and stale images at old positions cause ghosting on layout changes.
+	buf.WriteString("\x1b_Ga=d,d=a,q=2\x1b\\")
+	lastOverlayKey = key
+
+	// Always resend images (Kitty placements don't survive screen redraws)
+	// Row: terminal top border(1) + termHeight + terminal bottom border(1)
+	// + card top border(1) + 1 for content start
+	avatarRowBase := 1 + th + 1 + 1 + 1
+
 	panelTotalWidth := leftPanelWidth + 1
 	cardAreaStart := panelTotalWidth + 4 + 2
 
@@ -573,6 +1015,7 @@ func (m Model) renderDeleteConfirm() string {
 // ── HP Bar ────────────────────────────────────────────────────────
 
 const contextBytesMax = 1_600_000 // ~200K tokens worth of PTY traffic
+const defaultContextMax = 200_000 // default max context tokens
 
 func renderHPBar(inst *AgentInstance, width int) string {
 	if width < 4 {
@@ -585,19 +1028,41 @@ func renderHPBar(inst *AgentInstance, width int) string {
 	}
 
 	var hpFraction float64
+	var label string
+
 	switch inst.Status {
 	case "running":
-		hpFraction = 1.0 - float64(inst.ContextBytes)/float64(contextBytesMax)
+		if inst.ContextTokens > 0 {
+			// Real token data available
+			max := inst.ContextMax
+			if max == 0 {
+				max = defaultContextMax
+			}
+			hpFraction = 1.0 - float64(inst.ContextTokens)/float64(max)
+			label = fmt.Sprintf(" %dK/%dK", inst.ContextTokens/1000, max/1000)
+		} else {
+			// Fall back to byte estimate (~4 bytes per token)
+			estimatedTokens := inst.ContextBytes / 4
+			hpFraction = 1.0 - float64(estimatedTokens)/float64(defaultContextMax)
+		}
 		if hpFraction < 0 {
 			hpFraction = 0
 		}
 	case "exited":
-		if inst.ContextBytes > 0 {
-			hpFraction = 1.0 - float64(inst.ContextBytes)/float64(contextBytesMax)
-			if hpFraction < 0 {
-				hpFraction = 0
+		if inst.ContextTokens > 0 {
+			max := inst.ContextMax
+			if max == 0 {
+				max = defaultContextMax
 			}
+			hpFraction = 1.0 - float64(inst.ContextTokens)/float64(max)
+			label = fmt.Sprintf(" %dK/%dK", inst.ContextTokens/1000, max/1000)
+		} else if inst.ContextBytes > 0 {
+			estimatedTokens := inst.ContextBytes / 4
+			hpFraction = 1.0 - float64(estimatedTokens)/float64(defaultContextMax)
 		} else {
+			hpFraction = 0
+		}
+		if hpFraction < 0 {
 			hpFraction = 0
 		}
 	default: // idle
@@ -618,5 +1083,10 @@ func renderHPBar(inst *AgentInstance, width int) string {
 	}
 
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-	return lipgloss.NewStyle().Foreground(barColor).Render(bar)
+	result := lipgloss.NewStyle().Foreground(barColor).Render(bar)
+	if label != "" {
+		labelStyle := lipgloss.NewStyle().Foreground(colorTextDim)
+		result += labelStyle.Render(label)
+	}
+	return result
 }

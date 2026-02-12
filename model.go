@@ -1,17 +1,107 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
+
+// ── Pull Request Types ────────────────────────────────────────────
+
+type PullRequest struct {
+	Number    int             `json:"number"`
+	Title     string          `json:"title"`
+	State     string          `json:"state"`
+	Branch    string          `json:"headRefName"`
+	Author    string          `json:"author"`
+	IsDraft   bool            `json:"isDraft"`
+	Checks    PRChecksStatus  `json:"statusCheckRollup"`
+	ReviewDec string          `json:"reviewDecision"`
+	UpdatedAt string          `json:"updatedAt"`
+}
+
+type PRChecksStatus struct {
+	State string `json:"state"`
+}
+
+type prAuthor struct {
+	Login string `json:"login"`
+}
+
+func (pr *PullRequest) UnmarshalJSON(data []byte) error {
+	type Alias PullRequest
+	aux := &struct {
+		Author json.RawMessage `json:"author"`
+		*Alias
+	}{Alias: (*Alias)(pr)}
+
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if len(aux.Author) > 0 {
+		var a prAuthor
+		if json.Unmarshal(aux.Author, &a) == nil {
+			pr.Author = a.Login
+		}
+	}
+	return nil
+}
+
+type PRListMsg struct {
+	PRs []PullRequest
+	Err error
+}
+
+func (pr PullRequest) StatusIcon() string {
+	if pr.IsDraft {
+		return "◌"
+	}
+	switch pr.Checks.State {
+	case "SUCCESS":
+		if pr.ReviewDec == "APPROVED" {
+			return "✓"
+		}
+		return "●"
+	case "FAILURE", "ERROR":
+		return "✗"
+	case "PENDING":
+		return "○"
+	}
+	return "·"
+}
+
+func loadPRList(projectDir string) tea.Cmd {
+	return func() tea.Msg {
+		if projectDir == "" || projectDir == "." {
+			cwd, _ := os.Getwd()
+			projectDir = cwd
+		}
+		cmd := exec.Command("gh", "pr", "list", "--json",
+			"number,title,state,headRefName,author,isDraft,statusCheckRollup,reviewDecision,updatedAt",
+			"--limit", "25")
+		cmd.Dir = projectDir
+		out, err := cmd.Output()
+		if err != nil {
+			return PRListMsg{Err: err}
+		}
+		var prs []PullRequest
+		if err := json.Unmarshal(out, &prs); err != nil {
+			return PRListMsg{Err: err}
+		}
+		return PRListMsg{PRs: prs}
+	}
+}
 
 // ── Focus & Mode ───────────────────────────────────────────────────
 
@@ -31,6 +121,7 @@ const (
 	ModeSwap
 	ModeCharSheet
 	ModeCheckout
+	ModeCommandPalette
 )
 
 const MaxPartySlots = 8
@@ -53,18 +144,35 @@ type AgentInstance struct {
 	Passives []string
 	Model    string // model override
 
+	// Git worktree isolation
+	Worktree string // path to git worktree (empty if not isolated)
+	Branch   string // git branch for this worktree
+
+	// Handoff
+	LastOutput     string // final terminal output snapshot for handoff
+	HandoffContext string // injected context from another agent's handoff
+
 	// PTY state
 	Status       string // "idle", "running", "exited"
 	Task         string
 	cmd          *exec.Cmd
 	ptyFile      *os.File
 	emulator     *vt.SafeEmulator
-	ContextBytes int64 // total PTY bytes for HP bar
+	ContextBytes  int64     // total PTY bytes for HP bar
+	ContextTokens int       // parsed real token count (0 = use byte estimate)
+	ContextMax    int       // parsed max context tokens (0 = use default)
+	outputReads   int       // counter for periodic context scanning
+	lastOutputAt  time.Time // last PTY output for activity detection
 
 	// Pending changes (skills changed while running)
 	PendingEquipped []string
 	PendingPassives []string
 	HasPending      bool
+
+	// Cached half-block avatar render
+	cachedHalfBlock     string
+	cachedHalfBlockCols int
+	cachedHalfBlockRows int
 }
 
 // Party is a workspace with agent slots and a bench.
@@ -73,6 +181,21 @@ type Party struct {
 	Project string
 	Slots   [MaxPartySlots]*AgentInstance
 	Bench   []*AgentInstance
+}
+
+// ── Layout Cache ──────────────────────────────────────────────────
+
+type LayoutCache struct {
+	CardWidth     int
+	AvatarCols    int
+	AvatarRows    int
+	CardHeight    int
+	PartyHeight   int
+	CardsPerRow   int
+	TermWidth     int
+	TermHeight    int
+	MainPaneWidth int
+	valid         bool
 }
 
 // ── Model ──────────────────────────────────────────────────────────
@@ -86,6 +209,7 @@ type Model struct {
 
 	focus         FocusZone
 	mode          InputMode
+	modeStack     []InputMode // mode history for push/pop navigation
 	selectedAgent int
 	swapIndex     int
 
@@ -95,7 +219,10 @@ type Model struct {
 	bioScroll int // scroll offset for profile/bio section
 
 	// Checkout modal
-	checkoutAgent *AgentInstance
+	checkoutAgent  *AgentInstance
+	checkoutStep   int // 0=XP, 1=scroll naming, 2=handoff, 3=worktree
+	handoffTarget  int // index into party slots for handoff target
+	scrollNameBuf  string // text input for scroll name
 
 	// Wizard (nil when not active)
 	wizard *WizardState
@@ -103,13 +230,34 @@ type Model struct {
 	// Delete confirmation
 	deleteConfirm bool
 
+	// Git panel (files or PRs)
+	showGitPanel   bool
+	gitPanelMode   int // 0=files, 1=PRs
+	gitTreeLines   []string
+	gitPanelScroll int
+	prList         []PullRequest
+	prLoading      bool
+
+	// Command palette
+	cmdPaletteInput  string
+	cmdPaletteCursor int
+
+	// Layout cache (recomputed on resize/party change)
+	layout LayoutCache
+
+	// Auto-start flag for single-party skip-wizard flow
+	autoStartPending bool
+
+	// Agent index for O(1) lookup by ID
+	agentIndex map[string]*AgentInstance
+
 	width  int
 	height int
 	ready  bool
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return loadAvatarsAsync(m.config.Agents)
 }
 
 // ── Accessors ──────────────────────────────────────────────────────
@@ -147,6 +295,9 @@ func (m Model) lastSlotIndex() int {
 }
 
 func (m Model) agentByID(id string) *AgentInstance {
+	if m.agentIndex != nil {
+		return m.agentIndex[id]
+	}
 	for _, p := range m.parties {
 		for _, a := range p.Slots {
 			if a != nil && a.ID == id {
@@ -162,12 +313,63 @@ func (m Model) agentByID(id string) *AgentInstance {
 	return nil
 }
 
+func (m *Model) rebuildAgentIndex() {
+	idx := make(map[string]*AgentInstance)
+	for _, p := range m.parties {
+		for _, a := range p.Slots {
+			if a != nil {
+				idx[a.ID] = a
+			}
+		}
+		for _, a := range p.Bench {
+			if a != nil {
+				idx[a.ID] = a
+			}
+		}
+	}
+	m.agentIndex = idx
+}
+
+func (m *Model) pushMode(mode InputMode) {
+	m.modeStack = append(m.modeStack, m.mode)
+	m.mode = mode
+}
+
+func (m *Model) popMode() {
+	if len(m.modeStack) > 0 {
+		m.mode = m.modeStack[len(m.modeStack)-1]
+		m.modeStack = m.modeStack[:len(m.modeStack)-1]
+	} else {
+		m.mode = ModeNormal
+	}
+}
+
+func (m Model) partyForAgent(inst *AgentInstance) *Party {
+	for _, p := range m.parties {
+		for _, a := range p.Slots {
+			if a == inst {
+				return p
+			}
+		}
+		for _, a := range p.Bench {
+			if a == inst {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
 // ── Layout ─────────────────────────────────────────────────────────
 
 const leftPanelWidth = 20
+const gitPanelWidth = 30
 
 func (m Model) mainPaneWidth() int {
 	w := m.width - leftPanelWidth - 1 // panel content + border right
+	if m.showGitPanel {
+		w -= gitPanelWidth + 1
+	}
 	if w < 20 {
 		w = 20
 	}
@@ -175,16 +377,44 @@ func (m Model) mainPaneWidth() int {
 }
 
 func (m Model) termWidth() int {
+	if m.layout.valid {
+		return m.layout.TermWidth
+	}
 	return m.mainPaneWidth() - 2 // border
 }
 
 func (m Model) termHeight() int {
+	if m.layout.valid {
+		return m.layout.TermHeight
+	}
 	_, _, _, _, ph, _ := m.cardLayout()
-	h := m.height - ph - 4 // header(1) + border(2) + status(1)
+	h := m.height - ph - 3 // border(2) + status(1)
 	if h < 3 {
 		h = 3
 	}
 	return h
+}
+
+func (m *Model) recomputeLayout() {
+	mpw := m.mainPaneWidth()
+	cw, ac, ar, ch, ph, cpr := m.cardLayout()
+	tw := mpw - 2
+	th := m.height - ph - 3
+	if th < 3 {
+		th = 3
+	}
+	m.layout = LayoutCache{
+		CardWidth:     cw,
+		AvatarCols:    ac,
+		AvatarRows:    ar,
+		CardHeight:    ch,
+		PartyHeight:   ph,
+		CardsPerRow:   cpr,
+		TermWidth:     tw,
+		TermHeight:    th,
+		MainPaneWidth: mpw,
+		valid:         true,
+	}
 }
 
 func (m Model) cardLayout() (cardWidth, avatarCols, avatarRows, cardHeight, partyHeight, cardsPerRow int) {
@@ -250,7 +480,7 @@ func (m Model) cardLayout() (cardWidth, avatarCols, avatarRows, cardHeight, part
 	}
 
 	cardHeight = avatarRows + 4 // name + class + status + hp bar
-	partyHeight = (cardHeight + 2) * rows
+	partyHeight = (cardHeight+2)*rows + 1 // +1 for project dir footer
 	return
 }
 
@@ -260,12 +490,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return m.handleResize(msg)
+	case AvatarReadyMsg:
+		return m.handleAvatarReady(msg)
 	case AgentStartedMsg:
 		return m.handleAgentStarted(msg)
 	case AgentOutputMsg:
 		return m.handleAgentOutput(msg)
 	case AgentExitedMsg:
 		return m.handleAgentExited(msg)
+	case PRListMsg:
+		m.prLoading = false
+		if msg.Err == nil {
+			m.prList = msg.PRs
+		}
+		return m, nil
 	case forceResizeMsg:
 		return m, nil
 	case tea.MouseMsg:
@@ -289,6 +527,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleCharSheetMode(msg)
 		case ModeCheckout:
 			return m.handleCheckoutMode(msg)
+		case ModeCommandPalette:
+			return m.handleCommandPalette(msg)
 		default:
 			return m.handleNormalMode(msg)
 		}
@@ -302,11 +542,14 @@ func (m Model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	m.width = msg.Width
 	m.height = msg.Height
 	m.ready = true
+	m.recomputeLayout()
 
-	tw := m.termWidth()
-	th := m.termHeight()
+	tw := m.layout.TermWidth
+	th := m.layout.TermHeight
 
-	for _, p := range m.parties {
+	// Only resize active party agents
+	p := m.party()
+	if p != nil {
 		for _, inst := range p.Slots {
 			if inst != nil && inst.Status == "running" && inst.emulator != nil && inst.ptyFile != nil {
 				pty.Setsize(inst.ptyFile, &pty.Winsize{Rows: uint16(th), Cols: uint16(tw)})
@@ -314,6 +557,48 @@ func (m Model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+
+	if m.autoStartPending {
+		m.autoStartPending = false
+		return m.autoStartPartyAgents()
+	}
+
+	return m, nil
+}
+
+// ── Avatar Ready ──────────────────────────────────────────────────
+
+func (m Model) handleAvatarReady(msg AvatarReadyMsg) (tea.Model, tea.Cmd) {
+	if msg.Image == nil {
+		return m, nil
+	}
+	// Update the AgentConfig template
+	for i := range m.config.Agents {
+		if m.config.Agents[i].Name == msg.AgentName {
+			m.config.Agents[i].AvatarImage = msg.Image
+			m.config.Agents[i].KittyB64 = msg.KittyB64
+			break
+		}
+	}
+	// Propagate to all AgentInstances
+	for _, p := range m.parties {
+		for _, inst := range p.Slots {
+			if inst != nil && inst.AgentName == msg.AgentName {
+				inst.avatarImg = msg.Image
+				inst.kittyB64 = msg.KittyB64
+				inst.cachedHalfBlock = "" // invalidate cache
+			}
+		}
+		for _, inst := range p.Bench {
+			if inst != nil && inst.AgentName == msg.AgentName {
+				inst.avatarImg = msg.Image
+				inst.kittyB64 = msg.KittyB64
+				inst.cachedHalfBlock = ""
+			}
+		}
+	}
+	// Force Kitty overlay re-render
+	lastOverlayKey = ""
 	return m, nil
 }
 
@@ -327,6 +612,8 @@ func (m Model) handleAgentStarted(msg AgentStartedMsg) (tea.Model, tea.Cmd) {
 	inst.cmd = msg.Cmd
 	inst.ptyFile = msg.PtyFile
 	inst.emulator = msg.Emulator
+	inst.Worktree = msg.Worktree
+	inst.Branch = msg.Branch
 	inst.Status = "running"
 	inst.Task = "Running claude..."
 	inst.ContextBytes = 0
@@ -341,6 +628,14 @@ func (m Model) handleAgentOutput(msg AgentOutputMsg) (tea.Model, tea.Cmd) {
 	inst := m.agentByID(msg.ID)
 	if inst != nil && inst.Status == "running" {
 		inst.ContextBytes += int64(msg.BytesRead)
+		inst.lastOutputAt = time.Now()
+		inst.outputReads++
+
+		// Periodically scan terminal for context window info
+		if inst.outputReads%50 == 0 && inst.emulator != nil {
+			parseContextFromTerminal(inst)
+		}
+
 		return m, readAgentPTY(inst)
 	}
 	return m, nil
@@ -371,8 +666,19 @@ func (m Model) handleAgentExited(msg AgentExitedMsg) (tea.Model, tea.Cmd) {
 		inst.PendingPassives = nil
 	}
 
+	// Capture final output for handoff before closing emulator
+	if inst.emulator != nil {
+		inst.LastOutput = strings.ReplaceAll(inst.emulator.Render(), "\r\n", "\n")
+		// Trim to last ~2000 chars to keep handoff context reasonable
+		if len(inst.LastOutput) > 2000 {
+			inst.LastOutput = inst.LastOutput[len(inst.LastOutput)-2000:]
+		}
+	}
+
 	// Show checkout modal
 	m.checkoutAgent = inst
+	m.checkoutStep = 0
+	m.handoffTarget = -1
 	m.mode = ModeCheckout
 
 	// Cleanup PTY resources
@@ -442,7 +748,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// Click on party bar
 	if msg.Y > termBottom && msg.X >= panelRight {
 		m.focus = FocusPartyBar
-		cw, _, _, ch, _, cpr := m.cardLayout()
+		cw, ch, cpr := m.layout.CardWidth, m.layout.CardHeight, m.layout.CardsPerRow
 		cardStart := panelRight + 5
 		cardTotalWidth := cw + 2
 		cardTotalHeight := ch + 2
@@ -473,6 +779,12 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		m.stopAllAgents()
 		return m, tea.Quit
+
+	case ":":
+		m.pushMode(ModeCommandPalette)
+		m.cmdPaletteInput = ""
+		m.cmdPaletteCursor = 0
+		return m, nil
 
 	case "tab":
 		// Cycle focus zones
@@ -512,6 +824,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleLeftPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	prevParty := m.activeParty
 	switch msg.String() {
 	case "up", "k":
 		if m.activeParty > 0 {
@@ -536,7 +849,26 @@ func (m Model) handleLeftPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedAgent = 0
 		}
 	}
+	if m.activeParty != prevParty {
+		m.recomputeLayout()
+		m.resizeActivePartyAgents()
+	}
 	return m, nil
+}
+
+func (m *Model) resizeActivePartyAgents() {
+	p := m.party()
+	if p == nil {
+		return
+	}
+	tw := m.layout.TermWidth
+	th := m.layout.TermHeight
+	for _, inst := range p.Slots {
+		if inst != nil && inst.Status == "running" && inst.emulator != nil && inst.ptyFile != nil {
+			pty.Setsize(inst.ptyFile, &pty.Winsize{Rows: uint16(th), Cols: uint16(tw)})
+			inst.emulator.Resize(tw, th)
+		}
+	}
 }
 
 func (m Model) handleMainPaneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -558,7 +890,7 @@ func (m Model) handleMainPaneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Open character sheet
 		inst := m.agent()
 		if inst != nil {
-			m.mode = ModeCharSheet
+			m.pushMode(ModeCharSheet)
 			m.csSection = 0
 			m.csCursor = 0
 			m.bioScroll = 0
@@ -566,7 +898,7 @@ func (m Model) handleMainPaneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "i":
 		inst := m.agent()
 		if inst != nil && inst.Status == "running" {
-			m.mode = ModeInsert
+			m.pushMode(ModeInsert)
 		}
 	case "s":
 		inst := m.agent()
@@ -578,10 +910,14 @@ func (m Model) handleMainPaneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				inst.Task = "Starting..."
 				p := m.party()
 				projectDir := "."
-				if p != nil && p.Project != "" {
-					projectDir = p.Project
+				partyName := ""
+				if p != nil {
+					if p.Project != "" {
+						projectDir = p.Project
+					}
+					partyName = p.Name
 				}
-				return m, startAgent(inst, tw, th, m.config, projectDir)
+				return m, startAgent(inst, tw, th, m.config, projectDir, partyName)
 			}
 		}
 	case "x":
@@ -596,9 +932,11 @@ func (m Model) handleMainPaneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case " ":
 		p := m.party()
 		if p != nil && len(p.Bench) > 0 {
-			m.mode = ModeSwap
+			m.pushMode(ModeSwap)
 			m.swapIndex = 0
 		}
+	case "g":
+		return m.toggleGitPanel()
 	}
 	return m, nil
 }
@@ -616,7 +954,7 @@ func (m Model) handlePartyBarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		inst := m.agent()
 		if inst != nil {
-			m.mode = ModeCharSheet
+			m.pushMode(ModeCharSheet)
 			m.csSection = 0
 			m.csCursor = 0
 			m.bioScroll = 0
@@ -631,12 +969,18 @@ func (m Model) handlePartyBarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				inst.Task = "Starting..."
 				p := m.party()
 				projectDir := "."
-				if p != nil && p.Project != "" {
-					projectDir = p.Project
+				partyName := ""
+				if p != nil {
+					if p.Project != "" {
+						projectDir = p.Project
+					}
+					partyName = p.Name
 				}
-				return m, startAgent(inst, tw, th, m.config, projectDir)
+				return m, startAgent(inst, tw, th, m.config, projectDir, partyName)
 			}
 		}
+	case "g":
+		return m.toggleGitPanel()
 	}
 	return m, nil
 }
@@ -645,7 +989,7 @@ func (m Model) handlePartyBarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleInsertMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "esc" {
-		m.mode = ModeNormal
+		m.popMode()
 		return m, nil
 	}
 	inst := m.agent()
@@ -671,7 +1015,7 @@ func (m Model) handleSwapMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "esc":
-		m.mode = ModeNormal
+		m.popMode()
 	case "left", "h":
 		if m.swapIndex > 0 {
 			m.swapIndex--
@@ -698,6 +1042,7 @@ func (m Model) handleSwapMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.mode = ModeNormal
+		m.recomputeLayout()
 	}
 	return m, nil
 }
@@ -713,7 +1058,7 @@ func (m Model) handleCharSheetMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "esc":
-		m.mode = ModeNormal
+		m.popMode()
 		// Save skill changes to party file
 		m.saveCurrentParty()
 	case "tab":
@@ -757,10 +1102,14 @@ func (m Model) handleCharSheetMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = ModeNormal
 				p := m.party()
 				projectDir := "."
-				if p != nil && p.Project != "" {
-					projectDir = p.Project
+				partyName := ""
+				if p != nil {
+					if p.Project != "" {
+						projectDir = p.Project
+					}
+					partyName = p.Name
 				}
-				return m, startAgent(inst, tw, th, m.config, projectDir)
+				return m, startAgent(inst, tw, th, m.config, projectDir, partyName)
 			}
 		}
 	case "x":
@@ -845,6 +1194,20 @@ func (m Model) handleCheckoutMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	switch m.checkoutStep {
+	case 0:
+		return m.handleCheckoutXP(msg)
+	case 1:
+		return m.handleCheckoutScroll(msg)
+	case 2:
+		return m.handleCheckoutHandoff(msg)
+	case 3:
+		return m.handleCheckoutWorktree(msg)
+	}
+	return m, nil
+}
+
+func (m Model) handleCheckoutXP(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var xpGain int
 	switch msg.String() {
 	case "1":
@@ -871,7 +1234,141 @@ func (m Model) handleCheckoutMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		SaveRoster(m.roster)
 	}
 
+	// If rated Great, offer to save as Scroll
+	if xpGain == 50 {
+		m.checkoutStep = 1
+		m.scrollNameBuf = ""
+		return m, nil
+	}
+
+	return m.advanceCheckout(2)
+}
+
+// advanceCheckout skips to the next applicable checkout step from the given step.
+func (m Model) advanceCheckout(fromStep int) (tea.Model, tea.Cmd) {
+	if fromStep <= 2 && m.checkoutAgent.LastOutput != "" {
+		m.checkoutStep = 2
+		m.handoffTarget = 0
+		return m, nil
+	}
+	if fromStep <= 3 && m.checkoutAgent.Worktree != "" {
+		m.checkoutStep = 3
+		return m, nil
+	}
 	m.checkoutAgent = nil
+	m.checkoutStep = 0
+	m.mode = ModeNormal
+	return m, nil
+}
+
+func (m Model) handleCheckoutScroll(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		name := strings.TrimSpace(m.scrollNameBuf)
+		if name != "" {
+			go saveScroll(name, m.checkoutAgent, m.config)
+		}
+		return m.advanceCheckout(2)
+	case "esc":
+		return m.advanceCheckout(2)
+	case "backspace":
+		if len(m.scrollNameBuf) > 0 {
+			m.scrollNameBuf = m.scrollNameBuf[:len(m.scrollNameBuf)-1]
+		}
+	default:
+		r := []rune(msg.String())
+		if len(r) == 1 && r[0] >= ' ' {
+			m.scrollNameBuf += string(r)
+		}
+	}
+	return m, nil
+}
+
+// saveScroll persists the agent's effective prompt as a reusable skill (Scroll).
+func saveScroll(name string, inst *AgentInstance, cfg *ForgeConfig) {
+	composed := ComposePrompt(cfg, inst.ClassName, inst.Equipped, inst.Passives, inst.Directives)
+	if composed.Prompt == "" {
+		return
+	}
+
+	// Sanitize name for directory
+	dirName := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+	skillDir := filepath.Join(skillsDir(), dirName)
+	os.MkdirAll(skillDir, 0755)
+
+	content := fmt.Sprintf("---\nname: %s\ndescription: Scroll from %s (%s) session\n---\n\n%s\n",
+		name, inst.AgentName, inst.ClassName, composed.Prompt)
+
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0644)
+}
+
+func (m Model) handleCheckoutHandoff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	p := m.party()
+	if p == nil {
+		m.checkoutStep = 2
+		return m, nil
+	}
+
+	// Build list of other agents in the party (excluding the checkout agent)
+	var targets []*AgentInstance
+	for _, inst := range p.Slots {
+		if inst != nil && inst != m.checkoutAgent {
+			targets = append(targets, inst)
+		}
+	}
+
+	switch msg.String() {
+	case "up", "k":
+		if m.handoffTarget > 0 {
+			m.handoffTarget--
+		}
+	case "down", "j":
+		if m.handoffTarget < len(targets)-1 {
+			m.handoffTarget++
+		}
+	case "enter":
+		// Perform handoff to selected target
+		if m.handoffTarget >= 0 && m.handoffTarget < len(targets) {
+			target := targets[m.handoffTarget]
+			handoffCtx := fmt.Sprintf(
+				"\n\n## Handoff from %s (%s)\nThe following is the final output from %s's session. Use it as context:\n\n```\n%s\n```",
+				m.checkoutAgent.AgentName, m.checkoutAgent.ClassName,
+				m.checkoutAgent.AgentName,
+				m.checkoutAgent.LastOutput,
+			)
+			target.HandoffContext = handoffCtx
+		}
+		return m.advanceCheckout(3)
+	case "esc":
+		return m.advanceCheckout(3)
+	}
+	return m, nil
+}
+
+func (m Model) handleCheckoutWorktree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	p := m.partyForAgent(m.checkoutAgent)
+	projectDir := "."
+	if p != nil && p.Project != "" {
+		projectDir = p.Project
+	}
+
+	switch msg.String() {
+	case "1": // Merge to main
+		go cleanupWorktree(projectDir, m.checkoutAgent.Worktree, m.checkoutAgent.Branch, "merge")
+		m.checkoutAgent.Worktree = ""
+		m.checkoutAgent.Branch = ""
+	case "2", "esc": // Keep on branch
+		// Worktree stays for next session
+	case "3": // Discard
+		go cleanupWorktree(projectDir, m.checkoutAgent.Worktree, m.checkoutAgent.Branch, "discard")
+		m.checkoutAgent.Worktree = ""
+		m.checkoutAgent.Branch = ""
+	default:
+		return m, nil
+	}
+
+	m.checkoutAgent = nil
+	m.checkoutStep = 0
 	m.mode = ModeNormal
 	return m, nil
 }
@@ -917,6 +1414,8 @@ func (m Model) doDeleteParty() (Model, tea.Cmd) {
 			inst.cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
+	// Clean up git worktrees for this party
+	go cleanupPartyWorktrees(p.Name, p.Project)
 	os.Remove(partyPath(p.Name))
 	m.parties = append(m.parties[:m.activeParty], m.parties[m.activeParty+1:]...)
 	if m.activeParty >= len(m.parties) {
@@ -924,6 +1423,8 @@ func (m Model) doDeleteParty() (Model, tea.Cmd) {
 	}
 	m.selectedAgent = 0
 	m.deleteConfirm = false
+	m.recomputeLayout()
+	m.rebuildAgentIndex()
 	return m, nil
 }
 
@@ -980,13 +1481,14 @@ func (m Model) buildInstance(agentMap map[string]*AgentConfig, slot PartySlotCon
 
 	// Use per-agent avatar if available, otherwise fall back to shared + tinting
 	var agentAvatar image.Image
-	var kittyB64 string
+	kittyB64 := def.KittyB64
 	if def.AvatarImage != nil {
 		agentAvatar = def.AvatarImage
-		kittyB64 = encodeKittyAvatarDirect(def.AvatarImage)
 	} else {
 		agentAvatar = avatarImage
-		kittyB64 = encodeKittyAvatar(avatarImage, tint)
+		if kittyB64 == "" {
+			kittyB64 = encodeKittyAvatar(avatarImage, tint)
+		}
 	}
 
 	equipped := slot.Equipped
@@ -1038,6 +1540,114 @@ func (m Model) saveCurrentParty() {
 		}
 	}
 	SaveParty(pf)
+}
+
+// ── Git Panel ──────────────────────────────────────────────────────
+
+func (m Model) toggleGitPanel() (Model, tea.Cmd) {
+	var cmd tea.Cmd
+	if !m.showGitPanel {
+		// Open panel in files mode
+		m.showGitPanel = true
+		m.gitPanelMode = 0
+		p := m.party()
+		if p != nil {
+			m.gitTreeLines = loadGitTree(p.Project)
+		}
+		m.gitPanelScroll = 0
+	} else if m.gitPanelMode == 0 {
+		// Switch to PR mode
+		m.gitPanelMode = 1
+		m.gitPanelScroll = 0
+		m.prLoading = true
+		p := m.party()
+		projectDir := "."
+		if p != nil && p.Project != "" {
+			projectDir = p.Project
+		}
+		cmd = loadPRList(projectDir)
+	} else {
+		// Close panel
+		m.showGitPanel = false
+		m.gitPanelMode = 0
+	}
+
+	// Force overlay repositioning
+	lastOverlayKey = ""
+
+	m.recomputeLayout()
+	m.resizeActivePartyAgents()
+	return m, cmd
+}
+
+func loadGitTree(projectDir string) []string {
+	if projectDir == "" {
+		projectDir = "."
+	}
+	out, err := exec.Command("git", "-C", projectDir, "ls-files").Output()
+	if err != nil {
+		return []string{"(not a git repo)"}
+	}
+
+	files := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
+		return []string{"(no files)"}
+	}
+
+	// Build tree structure: map of dir -> children
+	type entry struct {
+		name  string
+		isDir bool
+	}
+	dirs := make(map[string][]entry)
+	seen := make(map[string]bool)
+
+	for _, f := range files {
+		parts := strings.Split(f, "/")
+		// Register all intermediate directories
+		for i := 0; i < len(parts)-1; i++ {
+			parent := strings.Join(parts[:i], "/")
+			dirName := parts[i]
+			key := parent + "/" + dirName
+			if !seen[key] {
+				seen[key] = true
+				dirs[parent] = append(dirs[parent], entry{dirName, true})
+			}
+		}
+		// Register the file
+		parent := strings.Join(parts[:len(parts)-1], "/")
+		fileName := parts[len(parts)-1]
+		dirs[parent] = append(dirs[parent], entry{fileName, false})
+	}
+
+	// Render tree recursively
+	var lines []string
+	var render func(prefix, dir string)
+	render = func(prefix, dir string) {
+		children := dirs[dir]
+		// Directories first, then files, alphabetical within each
+		var dirEntries, fileEntries []entry
+		for _, c := range children {
+			if c.isDir {
+				dirEntries = append(dirEntries, c)
+			} else {
+				fileEntries = append(fileEntries, c)
+			}
+		}
+		for _, d := range dirEntries {
+			lines = append(lines, prefix+d.name+"/")
+			childDir := d.name
+			if dir != "" {
+				childDir = dir + "/" + d.name
+			}
+			render(prefix+"  ", childDir)
+		}
+		for _, f := range fileEntries {
+			lines = append(lines, prefix+f.name)
+		}
+	}
+	render("", "")
+	return lines
 }
 
 // ── Cleanup ────────────────────────────────────────────────────────

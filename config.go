@@ -34,6 +34,7 @@ type AgentConfig struct {
 	Directives      string      `yaml:"-"` // operational sections for system prompt
 	DefaultEquipped []string    `yaml:"-"` // skill IDs from ## Skills section
 	AvatarImage     image.Image `yaml:"-"` // per-agent avatar loaded from assets/
+	KittyB64        string      `yaml:"-"` // cached base64 PNG for Kitty protocol
 }
 
 // SkillEntry represents a skill loaded from ~/.claude/skills/*/SKILL.md
@@ -87,7 +88,8 @@ func skillsDir() string  { return filepath.Join(claudeDir(), "skills") }
 func configPath() string { return filepath.Join(forgeDir(), "config.yaml") }
 func rosterPath() string { return filepath.Join(forgeDir(), "roster.yaml") }
 func partiesDir() string { return filepath.Join(forgeDir(), "parties") }
-func sessionsDir() string { return filepath.Join(forgeDir(), "sessions") }
+func sessionsDir() string  { return filepath.Join(forgeDir(), "sessions") }
+func worktreesDir() string { return filepath.Join(forgeDir(), "worktrees") }
 func partyPath(name string) string {
 	return filepath.Join(partiesDir(), name+".yaml")
 }
@@ -95,7 +97,7 @@ func partyPath(name string) string {
 // ── Load / Save ────────────────────────────────────────────────────
 
 func ensureForgeDir() error {
-	for _, d := range []string{forgeDir(), partiesDir(), sessionsDir(), agentsDir()} {
+	for _, d := range []string{forgeDir(), partiesDir(), sessionsDir(), worktreesDir(), agentsDir()} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return err
 		}
@@ -220,8 +222,6 @@ func LoadAgentsFromDir() ([]AgentConfig, error) {
 			a.Directives = extractDirectives(a.Bio)
 			a.DefaultEquipped = extractSkills(a.Bio)
 		}
-		// Load per-agent avatar image
-		a.AvatarImage = loadAgentAvatar(baseName)
 		agents = append(agents, a)
 	}
 	return agents, nil
@@ -402,34 +402,39 @@ func XPForNextLevel(level int) int {
 func DefaultConfig() *ForgeConfig {
 	return &ForgeConfig{
 		Classes: map[string]*ClassConfig{
-			"architect": {
+			"planner": {
 				Description:  "Strategic planner, breaks down complex tasks",
 				InnateSkills: []string{"writing-plans", "brainstorming"},
 				ToolProfile:  "full",
 			},
-			"coder": {
+			"developer": {
 				Description:  "Implementation specialist",
 				InnateSkills: []string{"test-driven-development", "systematic-debugging"},
 				ToolProfile:  "full",
 			},
-			"scout": {
+			"researcher": {
 				Description:  "Information gatherer",
 				InnateSkills: []string{"super-research"},
 				ToolProfile:  "readonly",
 			},
-			"scribe": {
-				Description:  "Communication specialist",
+			"tech writer": {
+				Description:  "Documentation specialist",
 				InnateSkills: []string{"writing-skills"},
 				ToolProfile:  "docs_git",
 			},
-			"sentinel": {
-				Description:  "Quality guardian",
+			"security": {
+				Description:  "Security and vulnerability specialist",
 				InnateSkills: []string{"verification-before-completion", "requesting-code-review"},
 				ToolProfile:  "full",
 			},
-			"sage": {
-				Description:  "Code quality analyst",
+			"code reviewer": {
+				Description:  "Code quality and review specialist",
 				InnateSkills: []string{"receiving-code-review", "sandi-metz-rules"},
+				ToolProfile:  "full",
+			},
+			"qa engineer": {
+				Description:  "Testing and CI/CD specialist",
+				InnateSkills: []string{"test-driven-development", "verification-before-completion"},
 				ToolProfile:  "full",
 			},
 		},
@@ -442,14 +447,14 @@ func DefaultConfig() *ForgeConfig {
 }
 
 var defaultAgents = []AgentConfig{
-	{Name: "Planner", Class: "architect", Tint: [3]uint8{220, 185, 105}},
-	{Name: "Builder", Class: "coder", Tint: [3]uint8{110, 160, 240}},
-	{Name: "Fixer", Class: "coder", Tint: [3]uint8{190, 110, 220}},
-	{Name: "Scout", Class: "scout", Tint: [3]uint8{105, 210, 150}},
-	{Name: "Scribe", Class: "scribe", Tint: [3]uint8{180, 195, 210}},
-	{Name: "Guard", Class: "sentinel", Tint: [3]uint8{210, 95, 85}},
-	{Name: "Reviewer", Class: "sage", Tint: [3]uint8{80, 190, 185}},
-	{Name: "Tester", Class: "sage", Tint: [3]uint8{165, 140, 100}},
+	{Name: "Planner", Class: "planner", Tint: [3]uint8{220, 185, 105}},
+	{Name: "Builder", Class: "developer", Tint: [3]uint8{110, 160, 240}},
+	{Name: "Fixer", Class: "developer", Tint: [3]uint8{190, 110, 220}},
+	{Name: "Scout", Class: "researcher", Tint: [3]uint8{105, 210, 150}},
+	{Name: "Scribe", Class: "tech writer", Tint: [3]uint8{180, 195, 210}},
+	{Name: "Guard", Class: "security", Tint: [3]uint8{210, 95, 85}},
+	{Name: "Reviewer", Class: "code reviewer", Tint: [3]uint8{80, 190, 185}},
+	{Name: "Tester", Class: "qa engineer", Tint: [3]uint8{165, 140, 100}},
 }
 
 // EnsureDefaultAgents creates YAML and .md files for any missing default agents.

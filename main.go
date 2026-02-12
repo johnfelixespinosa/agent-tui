@@ -7,48 +7,44 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func initialModel() (Model, error) {
-	// Ensure ~/.agent-forge/ exists
+// loadForgeConfig initializes the forge directory and loads all configuration.
+// Shared between TUI and headless (raid) modes.
+func loadForgeConfig() (*ForgeConfig, *RosterFile, error) {
 	if err := ensureForgeDir(); err != nil {
-		return Model{}, fmt.Errorf("creating forge dir: %w", err)
+		return nil, nil, fmt.Errorf("creating forge dir: %w", err)
 	}
 
-	// Load or create config
 	cfg, err := LoadConfig()
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg = DefaultConfig()
 			if err := SaveConfig(cfg); err != nil {
-				return Model{}, fmt.Errorf("saving default config: %w", err)
+				return nil, nil, fmt.Errorf("saving default config: %w", err)
 			}
 		} else {
-			return Model{}, fmt.Errorf("loading config: %w", err)
+			return nil, nil, fmt.Errorf("loading config: %w", err)
 		}
 	}
 
-	// Ensure default agents exist in ~/.claude/agents/
 	if err := EnsureDefaultAgents(); err != nil {
-		return Model{}, fmt.Errorf("seeding default agents: %w", err)
+		return nil, nil, fmt.Errorf("seeding default agents: %w", err)
 	}
 
-	// Load agents from ~/.claude/agents/*.yaml
 	agents, err := LoadAgentsFromDir()
 	if err != nil {
-		return Model{}, fmt.Errorf("loading agents: %w", err)
+		return nil, nil, fmt.Errorf("loading agents: %w", err)
 	}
 	cfg.Agents = agents
 
-	// Load skills from ~/.claude/skills/*/SKILL.md
 	skills, err := LoadSkillsFromDir()
 	if err != nil {
-		return Model{}, fmt.Errorf("loading skills: %w", err)
+		return nil, nil, fmt.Errorf("loading skills: %w", err)
 	}
 	cfg.Skills = skills
 
-	// Load or create roster
 	roster, err := LoadRoster()
 	if err != nil {
-		return Model{}, fmt.Errorf("loading roster: %w", err)
+		return nil, nil, fmt.Errorf("loading roster: %w", err)
 	}
 	for _, a := range cfg.Agents {
 		if roster.Agents[a.Name] == nil {
@@ -57,7 +53,15 @@ func initialModel() (Model, error) {
 	}
 	SaveRoster(roster)
 
-	// Load existing parties
+	return cfg, roster, nil
+}
+
+func initialModel() (Model, error) {
+	cfg, roster, err := loadForgeConfig()
+	if err != nil {
+		return Model{}, err
+	}
+
 	partyNames, err := ListPartyFiles()
 	if err != nil {
 		return Model{}, fmt.Errorf("listing parties: %w", err)
@@ -71,7 +75,6 @@ func initialModel() (Model, error) {
 		selectedAgent: 0,
 	}
 
-	// Build existing parties from files
 	for _, name := range partyNames {
 		pf, err := LoadParty(name)
 		if err != nil {
@@ -81,8 +84,12 @@ func initialModel() (Model, error) {
 		m.parties = append(m.parties, party)
 	}
 
-	// Start with wizard: choose existing party or create new
-	if len(m.parties) > 0 {
+	m.rebuildAgentIndex()
+
+	if len(m.parties) == 1 {
+		m.activeParty = 0
+		m.autoStartPending = true
+	} else if len(m.parties) > 1 {
 		m.wizard = &WizardState{
 			Step:               WizardChooseParty,
 			HasExistingParties: true,
@@ -99,6 +106,15 @@ func initialModel() (Model, error) {
 }
 
 func main() {
+	// Check for subcommands
+	if len(os.Args) > 1 && os.Args[1] == "raid" {
+		if err := runRaid(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	model, err := initialModel()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

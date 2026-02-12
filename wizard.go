@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"image/color"
 	"os"
 	"path/filepath"
 	"sort"
@@ -93,6 +92,7 @@ func (m Model) wizardChooseParty(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.activeParty = w.Cursor
 			m.selectedAgent = 0
 			m.wizard = nil
+			m.recomputeLayout()
 			return m.autoStartPartyAgents()
 		}
 		// "Create New" selected
@@ -300,6 +300,9 @@ func (m Model) doFinalizeWizard() (Model, tea.Cmd) {
 	m.mode = ModeNormal
 	m.focus = FocusMainPane
 
+	m.recomputeLayout()
+	m.rebuildAgentIndex()
+
 	return m.autoStartPartyAgents()
 }
 
@@ -319,7 +322,7 @@ func (m Model) autoStartPartyAgents() (Model, tea.Cmd) {
 	for _, inst := range p.Slots {
 		if inst != nil && inst.AgentName != "Empty" && inst.Status == "idle" {
 			inst.Task = "Starting..."
-			cmds = append(cmds, startAgent(inst, tw, th, m.config, p.Project))
+			cmds = append(cmds, startAgent(inst, tw, th, m.config, p.Project, p.Name))
 		}
 	}
 
@@ -538,10 +541,7 @@ func (m Model) renderWizardAgentList(title, step, dim, hint lipgloss.Style) stri
 			nameStyle = nameStyle.Bold(true)
 		}
 
-		className := a.Class
-		if len(className) > 0 {
-			className = strings.ToUpper(className[:1]) + className[1:]
-		}
+		className := strings.Title(a.Class)
 
 		line := fmt.Sprintf("%s%s %-10s %s", prefix, check, a.Name, className)
 		rendered := nameStyle.Render(line)
@@ -558,7 +558,7 @@ func (m Model) renderWizardAgentList(title, step, dim, hint lipgloss.Style) stri
 	avatarBlock := m.wizardAgentPreview(w.Cursor)
 
 	if avatarBlock != "" {
-		combined := lipgloss.JoinHorizontal(lipgloss.Center, listBlock, "  ", avatarBlock)
+		combined := lipgloss.JoinHorizontal(lipgloss.Top, listBlock, "      ", avatarBlock)
 		lines = append(lines, combined)
 	} else {
 		lines = append(lines, listBlock)
@@ -583,7 +583,7 @@ const (
 )
 
 // wizardAgentPreview returns a placeholder block for the Kitty avatar overlay
-// with agent name and class below.
+// with the agent's quote below.
 func (m Model) wizardAgentPreview(idx int) string {
 	if idx < 0 || idx >= len(m.config.Agents) {
 		return ""
@@ -600,32 +600,53 @@ func (m Model) wizardAgentPreview(idx int) string {
 	}
 	preview := strings.Join(avatarLines, "\n")
 
-	nameStyle := lipgloss.NewStyle().
-		Foreground(colorTextBright).
-		Bold(true).
-		Width(wizardAvatarCols).
-		Align(lipgloss.Center)
-	classStyle := lipgloss.NewStyle().
+	quoteWidth := wizardAvatarCols + 4
+	quoteStyle := lipgloss.NewStyle().
 		Foreground(colorTextDim).
-		Width(wizardAvatarCols).
+		Italic(true).
+		Width(quoteWidth).
 		Align(lipgloss.Center)
 
-	className := a.Class
-	if len(className) > 0 {
-		className = strings.ToUpper(className[:1]) + className[1:]
+	quote := extractQuote(a.Bio)
+	if quote == "" {
+		quote = a.Name
+	}
+
+	// Cap quote to 2 lines so the modal stays fixed size
+	rendered := quoteStyle.Render(quote)
+	qLines := strings.Split(rendered, "\n")
+	if len(qLines) > 2 {
+		qLines = qLines[:2]
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Center,
 		preview,
-		nameStyle.Render(a.Name),
-		classStyle.Render(className),
+		"",
+		strings.Join(qLines, "\n"),
 	)
+}
+
+// extractQuote returns the first blockquote line from agent markdown,
+// stripping the > prefix and surrounding quotes.
+func extractQuote(bio string) string {
+	for _, line := range strings.Split(bio, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "> ") {
+			q := strings.TrimPrefix(trimmed, "> ")
+			q = strings.Trim(q, "\"")
+			return q
+		}
+	}
+	return ""
 }
 
 // renderWizardKittyOverlay renders the Kitty graphics avatar for the wizard agent selection.
 func (m Model) renderWizardKittyOverlay() string {
-	if m.wizard == nil || m.wizard.Step != WizardAddAgents {
+	if m.wizard == nil {
 		return ""
+	}
+	if m.wizard.Step != WizardAddAgents {
+		return "\x1b_Ga=d,d=a,q=2\x1b\\" // clear leftover images
 	}
 	w := m.wizard
 	if w.Cursor < 0 || w.Cursor >= len(m.config.Agents) {
@@ -633,13 +654,7 @@ func (m Model) renderWizardKittyOverlay() string {
 	}
 
 	a := m.config.Agents[w.Cursor]
-	var b64 string
-	if a.AvatarImage != nil {
-		b64 = encodeKittyAvatarDirect(a.AvatarImage)
-	} else if avatarImage != nil {
-		tint := color.RGBA{a.Tint[0], a.Tint[1], a.Tint[2], 255}
-		b64 = encodeKittyAvatar(avatarImage, tint)
-	}
+	b64 := a.KittyB64
 	if b64 == "" {
 		return ""
 	}
@@ -650,10 +665,10 @@ func (m Model) renderWizardKittyOverlay() string {
 		boxWidth = m.width - 4
 	}
 
-	// Content height: header(4) + combined block + blank(1) + hint(1)
+	// Fixed content height: header(4) + agent list + blank(1) + hint(1)
 	agentCount := len(m.config.Agents)
-	avatarBlockH := wizardAvatarRows + 2 // avatar + name + class
 	combinedH := agentCount
+	avatarBlockH := wizardAvatarRows + 3 // avatar + spacer + 2 quote lines
 	if avatarBlockH > combinedH {
 		combinedH = avatarBlockH
 	}
@@ -664,16 +679,10 @@ func (m Model) renderWizardKittyOverlay() string {
 	boxTopRow := (m.height-boxH)/2 + 1
 	boxLeftCol := (m.width-boxWidth)/2 + 1
 
-	// Avatar centering within combined block
-	centerOffset := 0
-	if combinedH > avatarBlockH {
-		centerOffset = (combinedH - avatarBlockH) / 2
-	}
-
-	// Avatar screen position: border(1) + padding(1) + header(4) + centering
-	avatarRow := boxTopRow + 2 + 4 + centerOffset
-	// Column: border(1) + padding(3) + list width + spacer(2)
-	avatarCol := boxLeftCol + 4 + wizardListWidth + 2
+	// Avatar screen position: top-aligned, border(1) + padding(1) + header(4)
+	avatarRow := boxTopRow + 2 + 4
+	// Column: border(1) + padding(3) + list width + spacer(6)
+	avatarCol := boxLeftCol + 4 + wizardListWidth + 6
 
 	var buf strings.Builder
 	buf.WriteString("\x1b_Ga=d,d=a,q=2\x1b\\") // clear previous images
@@ -703,10 +712,7 @@ func (m Model) renderWizardReview(title, step, dim, hint lipgloss.Style) string 
 		class := ""
 		for _, a := range m.config.Agents {
 			if a.Name == name {
-				class = a.Class
-				if len(class) > 0 {
-					class = strings.ToUpper(class[:1]) + class[1:]
-				}
+				class = strings.Title(a.Class)
 				break
 			}
 		}

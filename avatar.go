@@ -12,8 +12,42 @@ import (
 	"path/filepath"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// AvatarReadyMsg is sent when a single agent's avatar finishes loading async.
+type AvatarReadyMsg struct {
+	AgentName string
+	Image     image.Image
+	KittyB64  string
+}
+
+// loadAvatarsAsync returns a tea.Cmd that loads all agent avatars in parallel.
+func loadAvatarsAsync(agents []AgentConfig) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, a := range agents {
+		agentName := a.Name
+		tint := color.RGBA{a.Tint[0], a.Tint[1], a.Tint[2], 255}
+		cmds = append(cmds, func() tea.Msg {
+			img := loadAgentAvatar(strings.ToLower(agentName))
+			if img == nil {
+				return AvatarReadyMsg{AgentName: agentName}
+			}
+			tinted := tintImage(img, tint)
+			b64 := encodeKittyAvatarDirect(tinted)
+			return AvatarReadyMsg{
+				AgentName: agentName,
+				Image:     tinted,
+				KittyB64:  b64,
+			}
+		})
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
 
 // Shared avatar image loaded once at startup.
 var avatarImage image.Image
@@ -122,6 +156,18 @@ func kittyImageSeq(b64Data string, cols, rows int) string {
 		}
 	}
 	return buf.String()
+}
+
+// halfBlockAvatar returns a cached half-block render, recomputing only when dimensions change.
+func (inst *AgentInstance) halfBlockAvatar(cols, rows int) string {
+	if cols == inst.cachedHalfBlockCols && rows == inst.cachedHalfBlockRows && inst.cachedHalfBlock != "" {
+		return inst.cachedHalfBlock
+	}
+	result := renderHalfBlockAvatar(inst.avatarImg, cols, rows)
+	inst.cachedHalfBlock = result
+	inst.cachedHalfBlockCols = cols
+	inst.cachedHalfBlockRows = rows
+	return result
 }
 
 // renderHalfBlockAvatar renders an image as colored half-block characters.
