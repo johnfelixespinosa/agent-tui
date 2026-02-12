@@ -597,8 +597,6 @@ func (m Model) handleAvatarReady(msg AvatarReadyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	// Force Kitty overlay re-render
-	lastOverlayKey = ""
 	return m, nil
 }
 
@@ -1571,9 +1569,6 @@ func (m Model) toggleGitPanel() (Model, tea.Cmd) {
 		m.showGitPanel = false
 		m.gitPanelMode = 0
 	}
-
-	// Force overlay repositioning
-	lastOverlayKey = ""
 
 	m.recomputeLayout()
 	m.resizeActivePartyAgents()

@@ -646,7 +646,7 @@ func (m Model) renderWizardKittyOverlay() string {
 		return ""
 	}
 	if m.wizard.Step != WizardAddAgents {
-		return "\x1b_Ga=d,d=a,q=2\x1b\\" // clear leftover images
+		return clearKittyImages()
 	}
 	w := m.wizard
 	if w.Cursor < 0 || w.Cursor >= len(m.config.Agents) {
@@ -685,10 +685,9 @@ func (m Model) renderWizardKittyOverlay() string {
 	avatarCol := boxLeftCol + 4 + wizardListWidth + 6
 
 	var buf strings.Builder
-	buf.WriteString("\x1b_Ga=d,d=a,q=2\x1b\\") // clear previous images
-	buf.WriteString(fmt.Sprintf("\x1b7\x1b[%d;%dH", avatarRow, avatarCol))
+	buf.WriteString(clearKittyImages())
+	buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", avatarRow, avatarCol))
 	buf.WriteString(kittyImageSeq(b64, wizardAvatarCols, wizardAvatarRows))
-	buf.WriteString("\x1b8")
 
 	return buf.String()
 }

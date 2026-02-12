@@ -70,11 +70,11 @@ func (m Model) View() string {
 	}
 
 	if m.deleteConfirm {
-		return m.renderDeleteConfirm()
+		return clearKittyImages() + m.renderDeleteConfirm()
 	}
 
 	if m.mode == ModeCommandPalette {
-		return m.renderCommandPalette()
+		return clearKittyImages() + m.renderCommandPalette()
 	}
 
 	if m.wizard != nil {
@@ -891,21 +891,19 @@ func (m Model) renderStatusBar() string {
 
 // ── Kitty Overlay ──────────────────────────────────────────────────
 
-// Package-level key tracking — only clear images when layout actually changes.
-var lastOverlayKey string
+// clearKittyImages returns escape sequences to delete all Kitty image placements.
+func clearKittyImages() string {
+	return "\x1b_Ga=d,d=a,q=2\x1b\\"
+}
 
 func (m Model) renderKittyOverlay() string {
 	if m.mode == ModeCheckout {
-		if lastOverlayKey != "" {
-			lastOverlayKey = ""
-			return "\x1b_Ga=d,d=a,q=2\x1b\\"
-		}
-		return ""
+		return clearKittyImages()
 	}
 
 	p := m.party()
 	if p == nil {
-		return ""
+		return clearKittyImages()
 	}
 
 	cw := m.layout.CardWidth
@@ -915,34 +913,23 @@ func (m Model) renderKittyOverlay() string {
 	cardsPerRow := m.layout.CardsPerRow
 	th := m.termHeight()
 
-	// Build a key from factors that affect avatar positions/content
-	var keyBuf strings.Builder
-	fmt.Fprintf(&keyBuf, "%d:%d:%d:%d:%d:%v:", m.activeParty, th, cw, avatarCols, avatarRows, m.showGitPanel)
-	for i := 0; i < MaxPartySlots; i++ {
-		if p.Slots[i] != nil {
-			keyBuf.WriteString(p.Slots[i].ID)
-		}
-		keyBuf.WriteByte(',')
-	}
-	if m.mode == ModeSwap {
-		fmt.Fprintf(&keyBuf, "swap:%d:%d", m.selectedAgent, m.swapIndex)
-	}
-	key := keyBuf.String()
-
 	var buf strings.Builder
 
-	// Always clear before placing — Kitty placements persist across redraws
-	// and stale images at old positions cause ghosting on layout changes.
-	buf.WriteString("\x1b_Ga=d,d=a,q=2\x1b\\")
-	lastOverlayKey = key
+	// Always clear all Kitty placements before placing new ones.
+	// Kitty images persist independently of text content, so stale
+	// placements from previous parties/layouts must be explicitly removed.
+	buf.WriteString(clearKittyImages())
 
-	// Always resend images (Kitty placements don't survive screen redraws)
 	// Row: terminal top border(1) + termHeight + terminal bottom border(1)
-	// + card top border(1) + 1 for content start
+	// + card top border(1) + center offset within card content(1)
 	avatarRowBase := 1 + th + 1 + 1 + 1
 
-	panelTotalWidth := leftPanelWidth + 1
-	cardAreaStart := panelTotalWidth + 4 + 2
+	// Column: measure party label width dynamically to avoid hardcoded offsets.
+	// Layout: leftPanel(20) + border(1) + padding(1) + label + spacer(1) + card_border(1) + center(1)
+	partyLabelW := lipgloss.Width(
+		lipgloss.NewStyle().MarginRight(1).Render("⚔"),
+	)
+	cardAreaStart := leftPanelWidth + 1 + 1 + partyLabelW + 1 + 1 + 1
 
 	cardIdx := 0
 	for i := 0; i < MaxPartySlots; i++ {
@@ -964,9 +951,11 @@ func (m Model) renderKittyOverlay() string {
 		avatarRow := avatarRowBase + row*(cardHeight+2)
 		col := cardAreaStart + colInRow*(cw+2)
 
-		buf.WriteString(fmt.Sprintf("\x1b7\x1b[%d;%dH", avatarRow, col))
-		buf.WriteString(kittyImageSeq(b64, avatarCols, avatarRows))
-		buf.WriteString("\x1b8")
+		// Only place images within terminal bounds to prevent clipping artifacts
+		if avatarRow > 0 && avatarRow+avatarRows <= m.height && col > 0 && col+avatarCols <= m.width {
+			buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", avatarRow, col))
+			buf.WriteString(kittyImageSeq(b64, avatarCols, avatarRows))
+		}
 		cardIdx++
 	}
 
